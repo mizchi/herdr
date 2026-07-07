@@ -229,6 +229,9 @@ pub struct HeadlessServer {
     shutting_down: bool,
     /// Flag set while exporting live PTYs to a replacement server.
     handoff_in_progress: bool,
+    /// A terminal input was forwarded to a pane; stream the next PTY echo without
+    /// waiting for the normal full-render frame throttle when a retained patch is safe.
+    low_latency_pty_render_pending: bool,
     /// Imported panes get one app-safe resize nudge after the first client attaches.
     #[cfg(unix)]
     pending_handoff_repaint_nudge: bool,
@@ -416,6 +419,7 @@ impl HeadlessServer {
             effective_size: (MIN_COLS, MIN_ROWS),
             shutting_down: false,
             handoff_in_progress: false,
+            low_latency_pty_render_pending: false,
             #[cfg(unix)]
             pending_handoff_repaint_nudge: false,
             should_quit,
@@ -524,26 +528,7 @@ impl HeadlessServer {
             self.app.sync_headless_animation_timer(now);
 
             // 7. Render virtually and stream frames.
-            if needs_render && self.app.can_render_now(now) {
-                crate::render_prof::event("render.attempt");
-                let pty_dirty = self.app.render_dirty.swap(false, Ordering::AcqRel);
-                if pty_dirty {
-                    crate::render_prof::event("render.attempt.pty_dirty");
-                }
-                if needs_full_render {
-                    crate::render_prof::event("retained_gate.needs_full_render");
-                } else if !pty_dirty {
-                    crate::render_prof::event("retained_gate.not_pty_dirty");
-                }
-                let rendered_retained =
-                    pty_dirty && !needs_full_render && self.render_retained_pty_update_and_stream();
-                if !rendered_retained {
-                    crate::render_prof::event("full_render.invoke");
-                    self.render_and_stream();
-                }
-                self.app.last_render_at = Some(now);
-                needs_render = false;
-                needs_full_render = false;
+            if self.render_and_stream_if_due(now, &mut needs_render, &mut needs_full_render) {
                 continue;
             }
 
@@ -2413,16 +2398,10 @@ impl HeadlessServer {
             &events,
             self.app.state.redraw_on_focus_gained,
         );
-        if let Some(client) = self.clients.get_mut(&client_id) {
-            if host_surface_redraw {
+        if host_surface_redraw {
+            if let Some(client) = self.clients.get_mut(&client_id) {
                 client.request_full_redraw();
                 client.render_pending = true;
-            } else {
-                // Ensure semantic clients receive one post-input frame even if the
-                // semantic buffer compares equal. Terminal-ANSI clients must keep their
-                // server-side blit baseline; resetting it here forces a full redraw on
-                // every keypress and makes remote sessions feel extremely slow.
-                client.request_semantic_redraw_after_input();
             }
         }
         self.update_client_outer_focus_from_events(client_id, &events);
@@ -2436,7 +2415,8 @@ impl HeadlessServer {
             self.resize_shared_runtime_to_effective_size_before_input();
         }
         let theme_changed = self.update_client_host_theme_from_events(client_id, &events);
-        self.app
+        let route = self
+            .app
             .route_client_events(events, self.foreground_client_id == Some(client_id));
         if self.app.take_config_reloaded_from_disk() {
             self.reload_server_config(false);
@@ -2462,7 +2442,23 @@ impl HeadlessServer {
 
             false
         } else {
-            foreground_changed || theme_changed || interaction
+            let immediate_render = host_surface_redraw
+                || foreground_changed
+                || theme_changed
+                || route.immediate_render_needed;
+            if immediate_render && !host_surface_redraw {
+                if let Some(client) = self.clients.get_mut(&client_id) {
+                    // Ensure semantic clients receive one post-input frame when
+                    // app state changed but terminal bytes did not produce a
+                    // retained PTY patch. Terminal-ANSI clients keep their blit
+                    // baseline; resetting it on every keypress is expensive.
+                    client.request_semantic_redraw_after_input();
+                }
+            }
+            if route.terminal_input_forwarded && !immediate_render {
+                self.low_latency_pty_render_pending = true;
+            }
+            immediate_render || (interaction && !route.terminal_input_forwarded)
         }
     }
 
@@ -3104,6 +3100,56 @@ impl HeadlessServer {
         for client_id in broken_clients {
             self.remove_client_and_resize_if_needed(client_id);
         }
+    }
+
+    fn render_and_stream_if_due(
+        &mut self,
+        now: Instant,
+        needs_render: &mut bool,
+        needs_full_render: &mut bool,
+    ) -> bool {
+        if !*needs_render {
+            return false;
+        }
+
+        let render_due = self.app.can_render_now(now);
+        let low_latency_retained_due = self.low_latency_pty_render_pending
+            && !*needs_full_render
+            && self.app.render_dirty.load(Ordering::Acquire);
+        if !render_due && !low_latency_retained_due {
+            return false;
+        }
+
+        crate::render_prof::event("render.attempt");
+        let pty_dirty = self.app.render_dirty.swap(false, Ordering::AcqRel);
+        if pty_dirty {
+            crate::render_prof::event("render.attempt.pty_dirty");
+        }
+        if *needs_full_render {
+            crate::render_prof::event("retained_gate.needs_full_render");
+        } else if !pty_dirty {
+            crate::render_prof::event("retained_gate.not_pty_dirty");
+        }
+
+        let rendered_retained =
+            pty_dirty && !*needs_full_render && self.render_retained_pty_update_and_stream();
+        if !rendered_retained {
+            if !render_due && low_latency_retained_due {
+                if pty_dirty {
+                    self.app.render_dirty.store(true, Ordering::Release);
+                }
+                self.low_latency_pty_render_pending = false;
+                return false;
+            }
+            crate::render_prof::event("full_render.invoke");
+            self.render_and_stream();
+        }
+
+        self.low_latency_pty_render_pending = false;
+        self.app.last_render_at = Some(now);
+        *needs_render = false;
+        *needs_full_render = false;
+        true
     }
 
     /// Renders the current state to client-sized virtual buffers and streams
@@ -4222,6 +4268,7 @@ mod tests {
             effective_size: (MIN_COLS, MIN_ROWS),
             shutting_down: false,
             handoff_in_progress: false,
+            low_latency_pty_render_pending: false,
             #[cfg(unix)]
             pending_handoff_repaint_nudge: false,
             #[cfg(unix)]
@@ -4394,13 +4441,31 @@ mod tests {
         std::sync::mpsc::Receiver<Vec<u8>>,
         crate::layout::PaneId,
     ) {
+        let (server, client_rx, pane_id, _input_rx) =
+            retained_test_server_with_input(initial_screen);
+        (server, client_rx, pane_id)
+    }
+
+    fn retained_test_server_with_input(
+        initial_screen: &[u8],
+    ) -> (
+        HeadlessServer,
+        std::sync::mpsc::Receiver<Vec<u8>>,
+        crate::layout::PaneId,
+        tokio::sync::mpsc::Receiver<Bytes>,
+    ) {
         let mut server = test_headless_server();
         let mut workspace = crate::workspace::Workspace::test_new("test");
         let pane_id = workspace.focused_pane_id().expect("focused pane");
-        workspace.insert_test_runtime(
-            pane_id,
-            crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, initial_screen),
-        );
+        let (runtime, input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                80,
+                24,
+                0,
+                initial_screen,
+                4,
+            );
+        workspace.insert_test_runtime(pane_id, runtime);
         server.app.state.workspaces = vec![workspace];
         server.app.state.active = Some(0);
         server.app.state.selected = 0;
@@ -4423,7 +4488,7 @@ mod tests {
         server.sync_foreground_client_state();
         server.resize_shared_runtime_to_effective_size();
 
-        (server, client_rx, pane_id)
+        (server, client_rx, pane_id, input_rx)
     }
 
     fn assert_frame_data_eq(actual: &FrameData, expected: &FrameData) {
@@ -5173,6 +5238,185 @@ next_tab = ""
                 server.has_app_client()
             ),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_key_input_does_not_force_immediate_full_render() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("test");
+        let pane_id = workspace.focused_pane_id().expect("focused pane");
+        let (runtime, mut input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        workspace.tabs[0].runtimes.insert(pane_id, runtime);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = app::Mode::Terminal;
+
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::TerminalAnsi,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+
+        let changed = server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: b"a".to_vec(),
+        });
+
+        assert!(!changed);
+        assert_eq!(input_rx.try_recv().unwrap(), Bytes::from_static(b"a"));
+    }
+
+    #[tokio::test]
+    async fn terminal_key_input_with_visible_state_change_requests_immediate_render() {
+        let mut server = test_headless_server();
+        let mut workspace = crate::workspace::Workspace::test_new("test");
+        let pane_id = workspace.focused_pane_id().expect("focused pane");
+        let (runtime, mut input_rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        workspace.tabs[0].runtimes.insert(pane_id, runtime);
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.selected = 0;
+        server.app.state.mode = app::Mode::Terminal;
+        server.app.state.selection = Some(crate::selection::Selection::anchor(pane_id, 0, 0, None));
+
+        server.clients.insert(
+            1,
+            ClientConnection::new(
+                (80, 24),
+                crate::kitty_graphics::HostCellSize::default(),
+                crate::terminal_theme::TerminalTheme::default(),
+                None,
+                1,
+                RenderEncoding::TerminalAnsi,
+                None,
+            ),
+        );
+        server.foreground_client_id = Some(1);
+
+        let changed = server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: b"a".to_vec(),
+        });
+
+        assert!(changed);
+        assert_eq!(input_rx.try_recv().unwrap(), Bytes::from_static(b"a"));
+        assert!(server.app.state.selection.is_none());
+        assert!(!server.low_latency_pty_render_pending);
+    }
+
+    #[tokio::test]
+    async fn input_echo_retained_render_bypasses_full_render_interval_once() {
+        let (mut server, client_rx, pane_id, mut input_rx) =
+            retained_test_server_with_input(b"aaaa");
+        server.render_and_stream();
+        let _ = client_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("initial frame");
+
+        let last_render = Instant::now();
+        server.app.last_render_at = Some(last_render);
+        assert!(!server.handle_server_event(ServerEvent::ClientInput {
+            client_id: 1,
+            data: b"a".to_vec(),
+        }));
+        assert_eq!(input_rx.try_recv().unwrap(), Bytes::from_static(b"a"));
+        assert!(server.low_latency_pty_render_pending);
+
+        let runtime = server
+            .app
+            .state
+            .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+            .expect("runtime");
+        runtime.test_process_pty_bytes(b"\rZ");
+        server.app.render_dirty.store(true, Ordering::Release);
+
+        let mut needs_render = true;
+        let mut needs_full_render = false;
+        assert!(server.render_and_stream_if_due(
+            last_render + Duration::from_millis(1),
+            &mut needs_render,
+            &mut needs_full_render,
+        ));
+
+        let frame = read_server_frame(
+            client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("retained frame"),
+        );
+        assert!(frame_text(&frame).contains('Z'));
+        assert!(!server.low_latency_pty_render_pending);
+        assert!(!needs_render);
+        assert!(!needs_full_render);
+    }
+
+    #[tokio::test]
+    #[ignore = "manual microbenchmark for input echo render latency"]
+    async fn input_echo_latency_microbench() {
+        let (mut server, client_rx, pane_id) = retained_test_server(b"aaaa");
+        server.render_and_stream();
+        let _ = client_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("initial frame");
+
+        let last_render = Instant::now();
+        let one_ms_after_render = last_render + Duration::from_millis(1);
+        server.app.last_render_at = Some(last_render);
+        let legacy_deadline = server
+            .app
+            .next_headless_loop_deadline_with_git_refresh(one_ms_after_render, true, false)
+            .expect("render deadline");
+        let legacy_wait = legacy_deadline.duration_since(one_ms_after_render);
+
+        let iterations = 200u32;
+        let mut total = Duration::ZERO;
+        let mut max = Duration::ZERO;
+        for index in 0..iterations {
+            let marker = if index % 2 == 0 { b'Z' } else { b'Y' };
+            let last_render = Instant::now();
+            server.app.last_render_at = Some(last_render);
+            server.low_latency_pty_render_pending = true;
+            {
+                let runtime = server
+                    .app
+                    .state
+                    .runtime_for_pane_in_workspace(&server.app.terminal_runtimes, 0, pane_id)
+                    .expect("runtime");
+                runtime.test_process_pty_bytes(&[b'\r', marker]);
+            }
+            server.app.render_dirty.store(true, Ordering::Release);
+
+            let mut needs_render = true;
+            let mut needs_full_render = false;
+            let started = Instant::now();
+            assert!(server.render_and_stream_if_due(
+                last_render + Duration::from_millis(1),
+                &mut needs_render,
+                &mut needs_full_render,
+            ));
+            let elapsed = started.elapsed();
+            total += elapsed;
+            max = max.max(elapsed);
+            let _ = client_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("retained frame");
+        }
+
+        eprintln!(
+            "input_echo_latency_microbench legacy_gate_wait_ms={} retained_avg_us={} retained_max_us={} iterations={}",
+            legacy_wait.as_millis(),
+            total.as_micros() / u128::from(iterations),
+            max.as_micros(),
+            iterations
         );
     }
 

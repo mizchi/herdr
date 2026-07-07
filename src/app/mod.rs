@@ -157,6 +157,12 @@ pub(crate) enum LoopEvent {
     RenderRequested,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClientInputRouteResult {
+    pub(crate) terminal_input_forwarded: bool,
+    pub(crate) immediate_render_needed: bool,
+}
+
 struct SyncOutputGuard;
 
 impl SyncOutputGuard {
@@ -1520,16 +1526,17 @@ impl App {
     /// focused pane's negotiated keyboard protocol instead of passing host
     /// terminal escape sequences through unchanged.
     #[cfg(test)]
-    pub(crate) fn route_client_input(&mut self, data: Vec<u8>) {
+    pub(crate) fn route_client_input(&mut self, data: Vec<u8>) -> ClientInputRouteResult {
         let events = crate::raw_input::parse_raw_input_bytes_sync(&data);
-        self.route_client_events(events, true);
+        self.route_client_events(events, true)
     }
 
     pub(crate) fn route_client_events(
         &mut self,
         events: Vec<crate::raw_input::RawInputEvent>,
         apply_host_terminal_theme: bool,
-    ) {
+    ) -> ClientInputRouteResult {
+        let mut result = ClientInputRouteResult::default();
         for event in events {
             let previous_mode = self.state.mode;
             match event {
@@ -1539,17 +1546,34 @@ impl App {
                         crossterm::event::KeyEventKind::Press => {
                             if self.state.mode == Mode::Terminal {
                                 self.suppressed_repeat_keys.remove(&key_id);
-                                self.handle_terminal_key_headless(key);
+                                let terminal_result = self.handle_terminal_key_headless(key);
+                                if terminal_result.forwarded {
+                                    result.terminal_input_forwarded = true;
+                                }
+                                if terminal_result.immediate_render_needed
+                                    || !terminal_result.forwarded
+                                {
+                                    result.immediate_render_needed = true;
+                                }
                             } else {
                                 self.suppressed_repeat_keys.insert(key_id);
                                 self.handle_non_terminal_key_headless(key);
+                                result.immediate_render_needed = true;
                             }
                         }
                         crossterm::event::KeyEventKind::Repeat => {
                             if self.state.mode == Mode::Terminal
                                 && !self.suppressed_repeat_keys.contains(&key_id)
                             {
-                                self.handle_terminal_key_headless(key);
+                                let terminal_result = self.handle_terminal_key_headless(key);
+                                if terminal_result.forwarded {
+                                    result.terminal_input_forwarded = true;
+                                }
+                                if terminal_result.immediate_render_needed
+                                    || !terminal_result.forwarded
+                                {
+                                    result.immediate_render_needed = true;
+                                }
                             }
                             // Repeats in non-terminal modes are ignored
                             // (same as monolithic behavior).
@@ -1566,10 +1590,12 @@ impl App {
                         self.state
                             .handle_pane_mouse_only(&self.terminal_runtimes, mouse);
                     }
+                    result.immediate_render_needed = true;
                 }
                 crate::raw_input::RawInputEvent::Paste(text) => {
                     if self.state.mode != Mode::Terminal {
                         self.paste_into_active_text_input(&text);
+                        result.immediate_render_needed = true;
                     } else {
                         if let Some(ws_idx) = self.state.active {
                             if let Some(ws) = self.state.workspaces.get(ws_idx) {
@@ -1579,17 +1605,23 @@ impl App {
                                         ws_idx,
                                         focused,
                                     ) {
-                                        let _ = runtime.try_send_bytes(bytes::Bytes::from(
-                                            if runtime
-                                                .input_state()
-                                                .map(|s| s.bracketed_paste)
-                                                .unwrap_or(false)
-                                            {
-                                                format!("\x1b[200~{text}\x1b[201~")
-                                            } else {
-                                                text
-                                            },
-                                        ));
+                                        let payload = if runtime
+                                            .input_state()
+                                            .map(|s| s.bracketed_paste)
+                                            .unwrap_or(false)
+                                        {
+                                            format!("\x1b[200~{text}\x1b[201~")
+                                        } else {
+                                            text
+                                        };
+                                        if runtime
+                                            .try_send_bytes(bytes::Bytes::from(payload))
+                                            .is_ok()
+                                        {
+                                            result.terminal_input_forwarded = true;
+                                        } else {
+                                            result.immediate_render_needed = true;
+                                        }
                                     }
                                 }
                             }
@@ -1597,21 +1629,26 @@ impl App {
                     }
                 }
                 crate::raw_input::RawInputEvent::OuterFocusGained
-                | crate::raw_input::RawInputEvent::OuterFocusLost => {}
+                | crate::raw_input::RawInputEvent::OuterFocusLost => {
+                    result.immediate_render_needed = true;
+                }
                 crate::raw_input::RawInputEvent::HostDefaultColor { kind, color } => {
                     if apply_host_terminal_theme {
                         self.update_host_terminal_theme(kind, color);
+                        result.immediate_render_needed = true;
                     }
                 }
                 crate::raw_input::RawInputEvent::HostColorSchemeChanged(appearance) => {
                     if apply_host_terminal_theme {
                         self.set_host_terminal_appearance(appearance, true);
+                        result.immediate_render_needed = true;
                     }
                 }
                 crate::raw_input::RawInputEvent::Unsupported => {}
             }
             self.sync_prefix_input_source(previous_mode);
         }
+        result
     }
 
     /// Handles a key event in non-terminal mode for the headless server.

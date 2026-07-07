@@ -13,18 +13,44 @@ struct PreparedPaneInput {
     bytes: Bytes,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TerminalKeyHeadlessResult {
+    pub(crate) forwarded: bool,
+    pub(crate) immediate_render_needed: bool,
+}
+
 fn is_modifier_only_key(code: &KeyCode) -> bool {
     matches!(code, KeyCode::Modifier(_))
 }
 
 impl App {
-    pub(crate) fn handle_terminal_key_headless(&mut self, key: TerminalKey) {
+    pub(crate) fn handle_terminal_key_headless(
+        &mut self,
+        key: TerminalKey,
+    ) -> TerminalKeyHeadlessResult {
+        let immediate_render_needed = self.terminal_key_pre_forward_changes_rendered_state();
         let Some(input) = self.prepare_terminal_key_forward(key) else {
-            return;
+            return TerminalKeyHeadlessResult {
+                forwarded: false,
+                immediate_render_needed,
+            };
         };
         if let Some(runtime) = self.lookup_runtime_sender(input.ws_idx, input.pane_id) {
-            let _ = runtime.try_send_bytes(input.bytes);
+            return TerminalKeyHeadlessResult {
+                forwarded: runtime.try_send_bytes(input.bytes).is_ok(),
+                immediate_render_needed,
+            };
         }
+        TerminalKeyHeadlessResult {
+            forwarded: false,
+            immediate_render_needed,
+        }
+    }
+
+    fn terminal_key_pre_forward_changes_rendered_state(&self) -> bool {
+        self.state.selection.is_some()
+            || self.state.selection_autoscroll.is_some()
+            || self.selection_autoscroll_deadline.is_some()
     }
 
     fn prepare_terminal_key_forward(&mut self, key: TerminalKey) -> Option<PreparedPaneInput> {
